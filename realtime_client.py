@@ -170,10 +170,19 @@ class RTWSClient:
                 await self.send("response.create", {"response": self.response_config})
             elif event["type"] == "input_audio_buffer.speech_started":
                 # The server has detected speech input from the user. Hence use this event to signal the UI to stop playing any audio if playing one
+                # Also trigger creation of user message placeholder
                 # print("conversation interrupted.......")
                 _event = {"type": "conversation_interrupted"}
                 # signal the UI to stop playing audio
                 self.dispatch("conversation.interrupted", _event)
+                
+                # Signal that user started speaking to create placeholder
+                _speech_event = {"type": "user_speech_started"}
+                self.dispatch("user.speech.started", _speech_event)
+            elif event["type"] == "input_audio_buffer.speech_stopped":
+                # User stopped speaking - can update placeholder to show processing
+                _speech_event = {"type": "user_speech_stopped"}
+                self.dispatch("user.speech.stopped", _speech_event)
             elif event["type"] == "response.audio_transcript.delta":
                 # this event is received when the transcript of the server's audio response to the user has started to come in.
                 # send this to the UI to display the transcript in the chat window, even as the audio of the response gets played
