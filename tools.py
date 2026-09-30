@@ -1,16 +1,9 @@
-from azure.core.credentials import AzureKeyCredential
-from azure.search.documents import SearchClient
-from chainlit.logger import logger
-import pyodbc
-from envconfig import DefaultConfig
-from atlassian import Jira
 from functions import (
-    perform_search_based_qna,
     get_claim_status_summary,
     get_grievance_status_def,
+    perform_search_based_qna,
     register_user_grievance_def,
 )
-
 
 tools_list = [
     {
@@ -26,17 +19,8 @@ tools_list = [
     {
         "type": "function",
         "name": "get_claim_status_summary",
-        "description": "retrieve the claim status summary for a patient based on the user name",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_name": {
-                    "type": "string",
-                    "description": "The user name of the Patient for whom the claim status is being retrieved",
-                }
-            },
-            "required": ["user_name"],
-        },
+        "description": "retrieve the claim status summary of the current user (the patient you are interacting with)",
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",

@@ -1,109 +1,47 @@
-# Message Sequencing Improvements
+# Message Sequencing
 
-## Overview
-This document outlines the improvements made to handle better message sequencing and streaming updates in the real-time chat conversation.
+## Problem
 
-## Problems Addressed
+The Voice Live / Realtime API emits events for the user's input transcript
+(`conversation.item.input_audio_transcription.completed`) and for the assistant's response transcript
+(`response.audio_transcript.delta`) asynchronously. The user transcript often arrives *after* the assistant has
+started responding, so naively appending messages puts the answer above the question.
 
-### 1. **Race Condition Issues**
-- **Problem**: User input transcript and assistant response transcript events arrived asynchronously, causing incorrect message ordering
-- **Solution**: Implemented proactive placeholder creation and state tracking
+## Approach
 
-### 2. **Delayed Message Updates** 
-- **Problem**: Messages only appeared after complete transcription, not streaming
-- **Solution**: Added immediate placeholder messages that update progressively
+### 1. Placeholder per user turn, keyed by the server `item_id`
 
-### 3. **Inconsistent Sequencing**
-- **Problem**: Sometimes assistant responses appeared before user messages
-- **Solution**: Added conversation state management and message ID tracking
+| Server event (voicelive_client.py) | UI event | Chat window (app.py) |
+| --- | --- | --- |
+| `input_audio_buffer.speech_started` plus speech lasting > `INTERRUPT_DEBOUNCE_MS` | `user.turn.started` | Placeholder `🎤 Listening...` created with id `user-<item_id>` |
+| `input_audio_buffer.speech_stopped` | `user.speech.stopped` | Placeholder updated to `🔄 Processing...` |
+| `input_audio_buffer.committed` (if no placeholder yet, e.g. a short "yes") | `user.turn.started` | Placeholder `🔄 Processing...` created |
+| `conversation.item.input_audio_transcription.completed` | `conversation.input.text.done` | Placeholder replaced by the transcript, or **removed** if the transcript is empty/noise such as `(coughs)` |
+| `response.audio_transcript.delta` | `conversation.text.delta` | Assistant message (id = assistant `item_id`) created, then streamed |
 
-## Key Improvements
+The placeholder is always created before the server creates the response (`committed` precedes `response.created`),
+so the user message is rendered above the assistant message. Because the server's `item_id` is the key, a late
+transcript always lands in the right bubble, even if several turns overlap.
 
-### 1. **Proactive Placeholder Creation**
-```python
-async def ensure_user_message_placeholder():
-    """Ensure a user message placeholder exists if one is needed"""
-```
-- Creates user message placeholders immediately when speech is detected
-- Uses visual indicators ("🎤 Listening...", "🔄 Processing...")
-- Tracks message IDs to prevent duplicates
+### 2. Single ordered dispatch queue
 
-### 2. **Enhanced State Management**
-```python
-conversation_state = {
-    "user_message_pending": False,
-    "last_user_message_id": None, 
-    "message_sequence": 0
-}
-```
-- Tracks conversation flow state
-- Prevents race conditions
-- Maintains message sequence integrity
+`VoiceLiveModelClient.dispatch()` puts UI events on an `asyncio.Queue` that a single worker drains. Previously each
+event was handled in its own `asyncio.create_task`, so a message `update()` could race ahead of its `send()`, or
+audio chunks could be reordered. The queue applies every send, update and audio chunk in arrival order.
 
-### 3. **Progressive Message Updates**
-- **Speech Started**: Shows "🎤 Listening..." immediately
-- **Speech Stopped**: Updates to "🔄 Processing..."
-- **Transcript Ready**: Updates with actual user input
-- **Assistant Response**: Streams in real-time via deltas
+### 3. Typed messages
 
-### 4. **New Event Handlers**
-- `user.speech.started`: Triggers immediate placeholder creation
-- `user.speech.stopped`: Updates placeholder to show processing state
-- Enhanced error handling and recovery
+Typed messages are already visible in the chat. The client stops playback and cancels any in-flight response
+(`response.cancel`), waits for it to finish, then sends the new message and `response.create`.
 
-### 5. **Better Error Handling**
-```python
-try:
-    # Message processing
-except Exception as e:
-    print(f"Error handling message: {e}")
-    # Graceful recovery
-```
+### 4. Stale audio after barge-in
 
-## Message Flow Sequence
+When a user turn is confirmed during an assistant response, that response's id is added to a suppression set.
+Its remaining `response.audio.delta` chunks are dropped instead of playing after the interruption.
 
-### Voice Input Flow:
-1. **User starts speaking** → Create placeholder with "🎤 Listening..."
-2. **User stops speaking** → Update placeholder to "🔄 Processing..."  
-3. **Transcript ready** → Update placeholder with actual text
-4. **Assistant starts responding** → Stream assistant response in real-time
+## Testing recommendations
 
-### Text Input Flow:
-1. **User types message** → Message appears immediately
-2. **Assistant starts responding** → Stream assistant response in real-time
-
-## Technical Implementation
-
-### Real-time Client Changes (`realtime_client.py`)
-- Added `user.speech.started` and `user.speech.stopped` event dispatching
-- Enhanced speech detection event handling
-
-### App Changes (`app.py`)  
-- Added `ensure_user_message_placeholder()` helper function
-- Enhanced conversation state management
-- Added progressive message update handlers
-- Improved error handling and logging
-
-## Benefits
-
-1. **Better User Experience**: Messages appear in correct sequence consistently
-2. **Real-time Feedback**: Users see immediate visual feedback when speaking
-3. **Streaming Updates**: Both user and assistant messages update progressively
-4. **Error Recovery**: Graceful handling of race conditions and errors
-5. **Debugging Support**: Added logging for troubleshooting sequence issues
-
-## Usage Notes
-
-- The system now handles both voice and text inputs seamlessly
-- Message placeholders provide immediate feedback
-- Progressive updates create a more natural conversation flow
-- State management prevents common race condition issues
-- Debug logging helps identify any remaining sequence problems
-
-## Testing Recommendations
-
-1. Test rapid voice inputs to ensure placeholders work correctly
-2. Test interrupting assistant responses while speaking
-3. Test mixing voice and text inputs
-4. Monitor console logs for any sequence warnings
-5. Test error recovery by simulating network issues
+1. Ask a question by voice and check the user bubble appears above the assistant's answer.
+2. Cough or tap the mic while the assistant is speaking: playback should continue, with no stray user bubble.
+3. Talk over the assistant: playback should stop within about half a second, and the new answer should follow your question.
+4. Mix voice and typed questions in the same session.

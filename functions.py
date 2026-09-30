@@ -1,191 +1,180 @@
-from chainlit.logger import logger
-from envconfig import DefaultConfig
-import pyodbc
-from azure.core.credentials import AzureKeyCredential
-from azure.search.documents import SearchClient
-from atlassian import Jira
+import struct
+from contextlib import closing
 
-def perform_search_based_qna(query):
-    logger.info("calling search to get context for the response ....")
-    credential = AzureKeyCredential(DefaultConfig.ai_search_key)
+import pyodbc
+from atlassian import Jira
+from azure.search.documents import SearchClient
+from chainlit.logger import logger
+
+from azure_auth import AZURE_SQL_SCOPE, CachedTokenCredential, get_access_token
+from envconfig import DefaultConfig
+
+# pyodbc connection attribute used to pass a Microsoft Entra access token to the ODBC driver
+SQL_COPT_SS_ACCESS_TOKEN = 1256
+
+
+def perform_search_based_qna(query: str) -> str:
+    """Retrieves grounding context from Azure AI Search using Microsoft Entra ID (managed identity)."""
+    logger.info(f"Searching the knowledge base for: {query}")
     client = SearchClient(
         endpoint=DefaultConfig.ai_search_url,
         index_name=DefaultConfig.ai_index_name,
-        credential=credential,
+        credential=CachedTokenCredential(),
     )
-    response = client.search(
-        search_text=query,
-        query_type="semantic",
-        semantic_configuration_name=DefaultConfig.ai_semantic_config,
-    )
-    response_docs = ""
-    counter = 0
-    results = list(response)
-    for result in results:
-        # logger.info(f"search result:  {result}  ")
-        logger.info(f"search result from document:  {result['content']}  ")
-        response_docs += (
-            " --- Document context start ---"
-            + result["content"]
-            + "\n ---End of Document ---\n"
-        )
-        counter += 1
-        if counter == 2:
-            break
-    logger.info("***********  calling LLM now ....***************")
-    return response_docs
-
-def init_jira_connection():
-    l_jira = None
     try:
-        l_jira = Jira(
-            url=DefaultConfig.attlassian_url,
-            username=DefaultConfig.attlassian_user_name,
-            password=DefaultConfig.attlassian_api_key,
+        results = client.search(
+            search_text=query,
+            query_type="semantic",
+            semantic_configuration_name=DefaultConfig.ai_semantic_config,
+            top=2,
         )
-        l_jira.myself()
-        print("Connected to Jira ticketing system....")
-        logger.info("Connected to Jira ticketing system....")
-        return l_jira
+        response_docs = ""
+        for result in results:
+            response_docs += (
+                " --- Document context start ---"
+                + result["content"]
+                + "\n ---End of Document ---\n"
+            )
+        return response_docs or "No relevant information was found in the knowledge base."
     except Exception as e:
-        logger.error(f"Error connecting to Jira: {e}")
-        logger.error("Exiting the program....")
-        exit(1)
+        logger.error(f"Error querying Azure AI Search: {e}")
+        return "We had an issue searching the knowledge base. Please try again in some time."
+    finally:
+        client.close()
 
-def get_grievance_status_def(grievance_id):
-    response_message = ""
-    response = ""
-    JQL = "project = " + DefaultConfig.grievance_project_name + " AND id = " + str(grievance_id)
-    l_jira = init_jira_connection()
+
+def _init_jira_connection() -> Jira:
+    jira = Jira(
+        url=DefaultConfig.attlassian_url,
+        username=DefaultConfig.attlassian_user_name,
+        password=DefaultConfig.attlassian_api_key,
+        cloud=True,
+    )
+    return jira
+
+
+def _adf_to_text(value) -> str:
+    """Jira Cloud's enhanced JQL search (REST v3) returns rich-text fields in Atlassian Document Format."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_adf_to_text(v) for v in value)
+    if isinstance(value, dict):
+        if value.get("type") == "text":
+            return value.get("text", "")
+        if value.get("type") == "hardBreak":
+            return "\n"
+        text = _adf_to_text(value.get("content"))
+        if value.get("type") in ("paragraph", "heading", "listItem"):
+            text += "\n"
+        return text
+    return str(value)
+
+
+def get_grievance_status_def(grievance_id) -> str:
     try:
-        response_message = l_jira.jql(JQL)
-        logger.info("Issue status retrieved successfully!")
-        logger.info("grievance status response .. ", response_message)
-        if response_message["issues"]:
-            response = (
-                "\n Here is the updated status of your grievance.\ngrievance_id : "
-                + response_message["issues"][0]["id"]
-            )
-            response += (
-                "\npriority : "
-                + response_message["issues"][0]["fields"]["priority"]["name"]
-            )
-            response += (
-                "\nstatus : "
-                + response_message["issues"][0]["fields"]["status"]["statusCategory"]["key"]
-            )
-            response += (
-                "\ngrievance description : "
-                + response_message["issues"][0]["fields"]["description"]
-            )
-            if response_message["issues"][0]["fields"]["duedate"]:
-                response += (
-                    "\ndue date : " + response_message["issues"][0]["fields"]["duedate"]
-                )
-            else:
-                response += "\ndue date : not assigned by the system yet."
+        grievance_id = int(grievance_id)
+    except (TypeError, ValueError):
+        return "The grievance id should be a number. Can you please verify your input again?"
+
+    jql = f'project = "{DefaultConfig.grievance_project_key}" AND id = {grievance_id}'
+    try:
+        response_message = _init_jira_connection().jql(jql)
+        issues = response_message.get("issues") or []
+        if not issues:
+            return "sorry, we could not locate a grievance with this ID. Can you please verify your input again?"
+
+        fields = issues[0]["fields"]
+        priority = (fields.get("priority") or {}).get("name", "not set")
+        status = fields["status"]["name"]
+        response = (
+            "\n Here is the updated status of your grievance.\ngrievance_id : "
+            + issues[0]["id"]
+            + "\npriority : "
+            + priority
+            + "\nstatus : "
+            + status
+            + "\ngrievance description : "
+            + str(_adf_to_text(fields.get("description")).strip())
+        )
+        if fields.get("duedate"):
+            response += "\ndue date : " + fields["duedate"]
         else:
-            response = "sorry, we could not locate a grievance with this ID. Can you please verify your input again?"
+            response += "\ndue date : not assigned by the system yet."
+        return response
     except Exception as e:
-        logger.error(f"Error retrieving the grievance: {e.args[0]}")
-        response = "We had an issue retrieving your grievance status. Please check back in some time"
-    return response
+        logger.error(f"Error retrieving the grievance: {e}")
+        return "We had an issue retrieving your grievance status. Please check back in some time"
 
-def register_user_grievance_def(grievance_category, grievance_description):
-    response_message = ""
+
+def register_user_grievance_def(grievance_category: str, grievance_description: str) -> str:
     try:
         issue_details = {
             "project": {"key": DefaultConfig.grievance_project_key},
             "summary": grievance_category,
             "description": grievance_description,
-            "issuetype": {"name": "Task"},
+            "issuetype": {"name": DefaultConfig.grievance_type},
         }
-        l_jira = init_jira_connection()
-        response = l_jira.create_issue(fields=issue_details)
-        response_message = (
+        response = _init_jira_connection().create_issue(fields=issue_details)
+        logger.info("Grievance registered successfully")
+        return (
             "We are sorry about the issue you are facing. We have registered a grievance with id "
             + response["id"]
             + " to track it to closure. Please quote that in your future communications with us"
         )
-        logger.info("Issue created successfully!")
     except Exception as e:
-        logger.error(f"Error registering the grievance issue: {e.args[0]}")
-        response_message = "We had an issue registering your grievance. Please check back in some time"
-    return response_message
+        logger.error(f"Error registering the grievance issue: {e}")
+        return "We had an issue registering your grievance. Please check back in some time"
 
-def get_claim_status_summary(user_name):
-    response_message = ""
-    cursor = None
-    logger.info(f"calling the database to fetch claim status summary for patient {user_name}")
-    l_connection = None
-    try:
-        l_connection = pyodbc.connect(
-            "Driver={ODBC Driver 18 for SQL Server};SERVER="
-            + DefaultConfig.az_db_server
-            + ";DATABASE="
-            + DefaultConfig.az_db_database
-            + ";UID="
-            + DefaultConfig.az_db_username
-            + ";PWD="
-            + DefaultConfig.az_db_password
-        )
-        cursor = l_connection.cursor()
-        query = """
-        SELECT 
+
+def _get_sql_connection() -> pyodbc.Connection:
+    """Opens a connection to Azure SQL Database authenticated with a Microsoft Entra access token."""
+    token = get_access_token(AZURE_SQL_SCOPE).encode("utf-16-le")
+    token_struct = struct.pack(f"<I{len(token)}s", len(token), token)
+    connection_string = (
+        f"Driver={{{DefaultConfig.az_db_driver}}};"
+        f"Server=tcp:{DefaultConfig.az_db_server},1433;"
+        f"Database={DefaultConfig.az_db_database};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    )
+    return pyodbc.connect(connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+
+
+def get_claim_status_summary(**_model_arguments) -> str:
+    # The patient is always the current user, never a name chosen by the model, so a user
+    # can't talk the assistant into disclosing another patient's claims.
+    user_name = DefaultConfig.customer_name
+    logger.info(f"Fetching claim status summary for patient {user_name}")
+    query = """
+        SELECT
             Claim_ID,
             Service_Type,
             Claim_Amount,
             Claim_Status,
             Reason_for_Denial,
             Patient_Name
-        FROM Health_Insurance_Claims 
+        FROM Health_Insurance_Claims
         WHERE Patient_Name = ?;
-        """
-        cursor.execute(query, user_name)
-        table_header = "| Claim ID | Service Type | Claim Amount | Claim Status | Reason for Denial | Patient Name |\n"
-        table_separator = "| --- | --- | --- | --- | --- | --- |\n"
-        table_rows = ""
-        for row in cursor:
+    """
+    try:
+        with closing(_get_sql_connection()) as connection:
+            cursor = connection.cursor()
+            cursor.execute(query, user_name)
+            rows = cursor.fetchall()
+
+        if not rows:
+            return f"No claims found for patient: {user_name}"
+
+        table = (
+            "| Claim ID | Service Type | Claim Amount | Claim Status | Reason for Denial | Patient Name |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+        )
+        for row in rows:
             reason_for_denial = row[4] if row[4] is not None else "N/A"
-            table_rows += f"| {row[0]} | {row[1]} | ${row[2]} | {row[3]} | {reason_for_denial} | {row[5]} |\n"
-        
-        if table_rows:
-            markdown_table = table_header + table_separator + table_rows
-        else:
-            markdown_table = f"No claims found for patient: {user_name}"
-            
-        l_connection.close()
-        return markdown_table
+            table += f"| {row[0]} | {row[1]} | ${row[2]} | {row[3]} | {reason_for_denial} | {row[5]} |\n"
+        return table
     except Exception as e:
         logger.error(f"Error in database query execution: {e}")
-        response_message = "We had an issue retrieving your claim status. Please check back in some time"
-        return response_message
-
-
-def init_database_connection() -> any:
-    l_connection = None
-    try:
-        l_connection = pyodbc.connect(
-            "Driver={ODBC Driver 18 for SQL Server};SERVER="
-            + DefaultConfig.az_db_server
-            + ";DATABASE="
-            + DefaultConfig.az_db_database
-            + ";UID="
-            + DefaultConfig.az_db_username
-            + ";PWD="
-            + DefaultConfig.az_db_password
-        )
-        print("Connected to the database....")
-        logger.info("Connected to the database....")
-        return l_connection
-    except Exception as e:
-        logger.error(f"Error connecting to the database: {e}")
-        logger.error("Exiting the program....")
-        exit(1)
-
-available_functions = {
-    "perform_search_based_qna": perform_search_based_qna,
-    "get_claim_status_summary": get_claim_status_summary,
-    "get_grievance_status_def": get_grievance_status_def,
-    "register_user_grievance_def": register_user_grievance_def,
-}
+        return "We had an issue retrieving your claim status. Please check back in some time"

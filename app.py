@@ -1,269 +1,185 @@
-import chainlit as cl
-from realtime_client import RTWSClient
-from uuid import uuid4
+import asyncio
+import logging
+import re
 import traceback
+from uuid import uuid4
+
+import chainlit as cl
+from chainlit.logger import logger
+
+from azure_auth import warm_up_tokens
+from envconfig import DefaultConfig
+from voicelive_client import VoiceLiveModelClient
+
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+system_prompt = f"""You are a voice AI Assistant representing {DefaultConfig.ai_assistant_organization_name}, tasked with helping users with answers to their queries.
+** Some rules you must follow during the conversation: **
+- ** You must use the information provided to you in the context of the conversation to respond to the user. DO NOT MAKE STUFF UP. If the context is not sufficient to answer the question, say you don't know**
+- ** When you get the user query try to identify the intent of the user and the right tool or function to call that can best answer it.**
+- Before registering a grievance, confirm the category and description with the user.
+- Your responses are spoken aloud. Keep them concise and conversational. When a tool returns a table, summarize it instead of reading out the table syntax.
+- If the user's input is unclear, noisy or incomplete (for example just a cough or background sound), do not guess; briefly ask them to repeat.
+Before responding, review what you are going to say out, and ensure it honours the rules above. If you are unsure, ask the user for clarification.
+
+The user name of the person you are interacting with is {DefaultConfig.customer_name}
+"""
 
 
-async def init_rtclient():
-    openai_realtime = RTWSClient(system_prompt=system_prompt)
+def _is_noise_transcript(transcript: str) -> bool:
+    """True for empty transcripts or non-speech annotations such as '(coughs)' or '[noise]'."""
+    text = (transcript or "").strip()
+    return not re.search(r"\w", text) or bool(re.fullmatch(r"[\(\[\*].*[\)\]\*]", text))
+
+
+def init_voice_client():
+    client = VoiceLiveModelClient(system_prompt=system_prompt)
     cl.user_session.set("track_id", str(uuid4()))
-    cl.user_session.set("transcript", ["1", "-"])
-    cl.user_session.set("user_input_transcript", ["1", ""])
-    cl.user_session.set("conversation_state", {
-        "user_message_pending": False,
-        "last_user_message_id": None,
-        "message_sequence": 0
-    })
+    # server item_id -> chainlit message id / accumulated assistant transcript
+    user_messages: dict[str, str] = {}
+    assistant_transcripts: dict[str, str] = {}
 
-    async def ensure_user_message_placeholder():
-        """Ensure a user message placeholder exists if one is needed"""
-        user_transcript_ref = cl.user_session.get("user_input_transcript")
-        conversation_state = cl.user_session.get("conversation_state")
-        
-        # Only create placeholder if we don't have a pending user message
-        if not conversation_state.get("user_message_pending", False):
-            user_transcript_msg_id = str(uuid4())
-            cl.user_session.set("user_input_transcript", [user_transcript_msg_id, ""])
-            conversation_state["user_message_pending"] = True
-            conversation_state["last_user_message_id"] = user_transcript_msg_id
-            conversation_state["message_sequence"] += 1
-            cl.user_session.set("conversation_state", conversation_state)
-            
-            await cl.Message(
-                content="🎤 Listening...",
-                author="user", 
-                type="user_message",
-                id=user_transcript_msg_id,
-            ).send()
-
-    async def handle_conversation_updated(event):
-        """Used to play the response audio chunks as they are received from the server."""
-        # print("event in conversation updated", event)
-        _audio = event.get("audio")
-        if _audio:
-            # 
-            # print("audio chunk received", _audio)
+    async def handle_audio(event):
+        """Plays response audio chunks as they are received from the server.
+        The browser audio player only exists while the microphone session is active; text-only
+        turns outside of it still get the transcript in the chat."""
+        audio = event.get("audio")
+        if audio and cl.user_session.get("audio_active"):
             await cl.context.emitter.send_audio_chunk(
-                cl.OutputAudioChunk(
-                    mimeType="pcm16", data=_audio, track=cl.user_session.get("track_id")
-                )
+                cl.OutputAudioChunk(mimeType="pcm16", data=audio, track=cl.user_session.get("track_id"))
             )
 
-    async def handle_conversation_interrupt(event):
-        """This applies when the user interrupts during an audio playback.
-        This stops the audio playback to listen to what the user has to say"""
-        # print("event in conversation interrupted", event)
+    async def handle_interrupt(event):
+        """Stops audio playback, when the user barges in or types a new message."""
         cl.user_session.set("track_id", str(uuid4()))
         await cl.context.emitter.send_audio_interrupt()
 
-    async def handle_conversation_thread_updated(event):
-        """Used to populate the chat context with transcription once an audio transcript of the response is done."""
-        try:
-            # print("event in conversation text delta", event)
-            item_id = event.get("item_id")
-            delta = event.get("transcript")
-            if delta:
-                transcript_ref = cl.user_session.get("transcript")
-                # print(f"item_id in delta is {item_id}, and the one in the session is {transcript_ref[0]}")
-                
-                # identify if there is a new message or an update to an existing message (i.e. delta to an existing transcript)
-                if transcript_ref[0] == item_id:
-                    _transcript = transcript_ref[1] + delta
-                    transcript_ref = [item_id, _transcript]
-                    cl.user_session.set("transcript", transcript_ref)
-                    # appending the delta transcript from audio to the previous transcript
-                    # using the message id as the key to update the message in the chat window
-                    await cl.Message(
-                        content=_transcript,
-                        author="assistant",
-                        type="assistant_message",
-                        id=item_id,
-                    ).update()
-                else:
-                    # New assistant response starting 
-                    print(f"Starting new assistant response with ID: {item_id}")
-                    
-                    # Check if we need to finalize any pending user message first
-                    conversation_state = cl.user_session.get("conversation_state")
-                    if conversation_state.get("user_message_pending", False):
-                        user_transcript_ref = cl.user_session.get("user_input_transcript")
-                        msg_id = user_transcript_ref[0]
-                        print(f"Finalizing pending user message {msg_id} before assistant response")
-                        # Update with a temporary message if transcript isn't ready yet
-                        await cl.Message(
-                            content="[Voice input - processing transcript...]",
-                            author="user",
-                            type="user_message",
-                            id=msg_id,
-                        ).update()
-                    
-                    # now populate the assistant response transcript in the chat interface
-                    transcript_ref = [item_id, delta]
-                    cl.user_session.set("transcript", transcript_ref)
-                    await cl.Message(
-                        content=delta,
-                        author="assistant",
-                        type="assistant_message",
-                        id=item_id,
-                    ).send()
-                    print(f"Created new assistant message {item_id} with initial content: {delta[:50]}...")
-                    
-        except Exception as e:
-            print(f"Error handling conversation thread update: {e}")
-            # Continue gracefully
-
-    async def handle_user_input_transcript_done(event):
-        """Used to populate the chat context with transcription once an audio transcript of user input is completed.
-        This updates the placeholder message that was created earlier.
-        """
-        try:
-            # print("event in conversation input text done", event)
-            transcript = event.get("transcript")
-            user_transcript_ref = cl.user_session.get("user_input_transcript")
-            conversation_state = cl.user_session.get("conversation_state")
-            msg_id = user_transcript_ref[0]
-            
-            # Validate that this is the expected message
-            if msg_id != conversation_state.get("last_user_message_id"):
-                print(f"Warning: Message ID mismatch. Expected: {conversation_state.get('last_user_message_id')}, Got: {msg_id}")
-            
-            if transcript and transcript.strip():
-                # Update the placeholder message with the actual transcript
-                await cl.Message(
-                    content=transcript, 
-                    author="user", 
-                    type="user_message",
-                    id=msg_id
-                ).update()
-                print(f"Updated user message {msg_id} with transcript: {transcript[:50]}...")
-            else:
-                # If transcript is empty, update with a fallback message
-                await cl.Message(
-                    content="[Voice input received]", 
-                    author="user", 
-                    type="user_message",
-                    id=msg_id
-                ).update()
-                print(f"Updated user message {msg_id} with fallback content")
-            
-            # Reset the conversation state
-            conversation_state["user_message_pending"] = False
-            conversation_state["last_user_message_id"] = None
-            cl.user_session.set("conversation_state", conversation_state)
-            cl.user_session.set("user_input_transcript", [str(uuid4()), ""])
-            
-        except Exception as e:
-            print(f"Error handling user input transcript: {e}")
-            # Try to recover gracefully
-            conversation_state = cl.user_session.get("conversation_state", {})
-            conversation_state["user_message_pending"] = False
-            cl.user_session.set("conversation_state", conversation_state)
-
-    async def handle_user_speech_started(event):
-        """Handle when user starts speaking - create placeholder message immediately"""
-        await ensure_user_message_placeholder()
+    async def handle_user_turn_started(event):
+        """Creates a user message placeholder as soon as a real user turn is detected, so it is
+        always rendered before the assistant's response even though the transcript arrives later."""
+        item_id = event["item_id"]
+        msg_id = f"user-{item_id}"
+        user_messages[item_id] = msg_id
+        await cl.Message(content=event["status"], author="user", type="user_message", id=msg_id).send()
 
     async def handle_user_speech_stopped(event):
-        """Handle when user stops speaking - update placeholder to show processing"""
-        user_transcript_ref = cl.user_session.get("user_input_transcript")
-        conversation_state = cl.user_session.get("conversation_state")
-        
-        if conversation_state.get("user_message_pending", False):
-            msg_id = user_transcript_ref[0]
-            await cl.Message(
-                content="🔄 Processing...",
-                author="user",
-                type="user_message", 
-                id=msg_id,
-            ).update()
+        msg_id = user_messages.get(event["item_id"])
+        if msg_id:
+            await cl.Message(content="🔄 Processing...", author="user", type="user_message", id=msg_id).update()
 
-    openai_realtime.on("conversation.updated", handle_conversation_updated)
-    openai_realtime.on("conversation.interrupted", handle_conversation_interrupt)
-    openai_realtime.on("conversation.text.delta", handle_conversation_thread_updated)
-    openai_realtime.on("conversation.input.text.done", handle_user_input_transcript_done)
-    openai_realtime.on("user.speech.started", handle_user_speech_started)
-    openai_realtime.on("user.speech.stopped", handle_user_speech_stopped)
-    cl.user_session.set("openai_realtime", openai_realtime)
+    async def handle_user_transcript_done(event):
+        item_id = event.get("item_id")
+        transcript = event.get("transcript") or ""
+        msg_id = user_messages.pop(item_id, None)
+        if _is_noise_transcript(transcript):
+            if msg_id:
+                await cl.Message(content="", id=msg_id).remove()
+            logger.info(f"Ignoring non-speech input transcript: {transcript!r}")
+            return
+        message = cl.Message(content=transcript, author="user", type="user_message", id=msg_id or str(uuid4()))
+        await (message.update() if msg_id else message.send())
+
+    async def handle_assistant_transcript_delta(event):
+        item_id = event["item_id"]
+        delta = event.get("transcript")
+        if not delta:
+            return
+        is_new = item_id not in assistant_transcripts
+        assistant_transcripts[item_id] = assistant_transcripts.get(item_id, "") + delta
+        message = cl.Message(
+            content=assistant_transcripts[item_id], author="assistant", type="assistant_message", id=item_id
+        )
+        await (message.send() if is_new else message.update())
+
+    async def handle_tool_call(event):
+        logger.info(f"Calling tool {event['name']} with {event['arguments']}")
+
+    async def handle_error(event):
+        await cl.ErrorMessage(content=f"Voice Live error: {event['message']}").send()
+
+    client.on("conversation.updated", handle_audio)
+    client.on("conversation.interrupted", handle_interrupt)
+    client.on("user.turn.started", handle_user_turn_started)
+    client.on("user.speech.stopped", handle_user_speech_stopped)
+    client.on("conversation.input.text.done", handle_user_transcript_done)
+    client.on("conversation.text.delta", handle_assistant_transcript_delta)
+    client.on("tool.call", handle_tool_call)
+    client.on("error", handle_error)
+    cl.user_session.set("voice_client", client)
+    return client
 
 
-system_prompt = """You are an AI Assistant representing Contoso insurance, tasked with helping users with answers to their queries. 
-Respond to the user queries with both text and audio in your responses.
-** Some rules you must follow during the conversation: **
-- ** You must use the information provided to you in the context of the conversation to respond to the user. DO NOT MAKE STUFF UP. If the context is not sufficient to answer the question, say you don't know**
-- ** When you get the user query try to identify the intent of the user and the right tool or function to call that can best answer it.
-Before responding, review what you are going to say out, and ensure it honours the rules above. If you are unsure, ask the user for clarification.
-
-The user name of the person you are interacting with is Srikantan
-"""
+def get_voice_client() -> VoiceLiveModelClient:
+    return cl.user_session.get("voice_client") or init_voice_client()
 
 
 @cl.on_chat_start
 async def start():
+    init_voice_client()
+    asyncio.create_task(asyncio.to_thread(warm_up_tokens))
     await cl.Message(
-        content="Hi, Welcome! You are now connected to Realtime' AI Assistant representing Contoso insurance. Press `P` to talk!"
+        content=f"Hi, Welcome! You are now connected to the Voice AI Assistant representing {DefaultConfig.ai_assistant_organization_name}. "
+        "Click the microphone icon (or press `P`) to talk. You can also type your question; replies are spoken while the microphone is on."
     ).send()
-    await init_rtclient()
-    openai_realtime: RTWSClient = cl.user_session.get("openai_realtime")
-    print("status of connection to realtime api", openai_realtime.is_connected())
-
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """Handle text messages sent through the chat interface"""
-    openai_realtime: RTWSClient = cl.user_session.get("openai_realtime")
-    if openai_realtime and openai_realtime.is_connected():
-        # For text messages, we don't need to create placeholders since the message is already visible
-        # Reset any pending user message state since this is a direct text input
-        conversation_state = cl.user_session.get("conversation_state", {})
-        conversation_state["user_message_pending"] = False
-        cl.user_session.set("conversation_state", conversation_state)
-        
-        await openai_realtime.send_user_message_content(
-            [{"type": "input_text", "text": message.content}]
-        )
-    else:
-        await cl.Message(
-            content="Please activate voice mode before sending messages!"
-        ).send()
+    """Handles text messages typed in the chat window."""
+    client = get_voice_client()
+    try:
+        await client.connect()
+        await client.send_user_message_content([{"type": "input_text", "text": message.content}])
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        await cl.ErrorMessage(content=f"Failed to send message to Voice Live API: {e}").send()
 
 
 @cl.on_audio_start
 async def on_audio_start():
     try:
-        openai_realtime: RTWSClient = cl.user_session.get("openai_realtime")
-        await openai_realtime.connect()
-        print("audio started")
+        await get_voice_client().connect()
+        cl.user_session.set("audio_active", True)
         return True
     except Exception as e:
-        await cl.ErrorMessage(
-            content=f"Failed to connect to OpenAI realtime: {e}"
-        ).send()
+        logger.error(traceback.format_exc())
+        await cl.ErrorMessage(content=f"Failed to connect to Voice Live API: {e}").send()
         return False
 
 
 @cl.on_audio_chunk
 async def on_audio_chunk(chunk: cl.InputAudioChunk):
-    openai_realtime: RTWSClient = cl.user_session.get("openai_realtime")
+    client = get_voice_client()
+    if not cl.user_session.get("audio_active"):
+        return
     try:
-        if openai_realtime:
-            if openai_realtime and openai_realtime.is_connected():
-                await openai_realtime.append_input_audio(chunk.data)
-            # else:
-                # print("??????????RealtimeClient is not connected???????????")
+        if not client.is_connected():
+            # the service closed the session (e.g. idle timeout); start a new one
+            await client.connect()
+        await client.append_input_audio(chunk.data)
     except Exception as e:
-        print(f"Failed to send audio chunk to OpenAI realtime: \n{traceback.format_exc()}")
-        await cl.ErrorMessage(
-            content=f"Failed to send audio chunk to OpenAI realtime: {e}"
-        ).send()
-        
+        logger.error(traceback.format_exc())
+        # stop retrying on every chunk until the user restarts the microphone
+        cl.user_session.set("audio_active", False)
+        await cl.ErrorMessage(content=f"Failed to send audio to Voice Live API: {e}. Please restart the microphone.").send()
 
 
 @cl.on_audio_end
-@cl.on_chat_end
+async def on_audio_end():
+    # The session is kept open so the conversation context is retained for further voice or text turns.
+    cl.user_session.set("audio_active", False)
+    logger.info("Microphone stopped")
+
+
 @cl.on_stop
-async def on_end():
-    openai_realtime: RTWSClient = cl.user_session.get("openai_realtime")
-    if openai_realtime and openai_realtime.is_connected():
-        print("RealtimeClient session ended")
-        await openai_realtime.disconnect()
+async def on_stop():
+    client = cl.user_session.get("voice_client")
+    if client and client.is_connected():
+        await client.interrupt_response()
+
+
+@cl.on_chat_end
+async def on_chat_end():
+    client = cl.user_session.get("voice_client")
+    if client:
+        await client.disconnect()
