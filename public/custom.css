@@ -1,0 +1,12 @@
+/* Configuration side panel: let long endpoints / hostnames wrap instead of being clipped,
+   while keeping the label column readable */
+table td:last-child {
+  overflow-wrap: anywhere;
+}
+table td:first-child,
+table th:first-child {
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: none;
+  min-width: 7.5rem;
+}

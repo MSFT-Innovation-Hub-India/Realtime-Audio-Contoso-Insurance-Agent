@@ -1,0 +1,5 @@
+# Development and test tooling (in addition to requirements.txt)
+pytest>=8.0
+numpy>=2.0
+# live browser test with a fake microphone (tests/live/ui_fake_mic_test.py); then run: python -m playwright install chromium
+playwright>=1.48

@@ -56,6 +56,13 @@ class DefaultConfig:
     az_db_server = os.getenv("az_db_server")
     az_db_database = os.getenv("az_db_database")
     az_db_driver = os.getenv("az_db_driver", "ODBC Driver 18 for SQL Server")
+    # login timeout (seconds); generous so cold starts in Azure Container Apps don't fail the first query
+    az_db_connection_timeout = _num("az_db_connection_timeout", 60, int)
 
     ai_assistant_organization_name = "Contoso Insurance"
     customer_name = os.getenv("customer_name", "Srikantan")
+    # Gender of the assistant persona; must match the TTS voice (Meera is female). Drives first-person
+    # grammatical gender in Hindi and other gendered languages ("मैं कर सकती हूँ" vs "मैं कर सकता हूँ").
+    assistant_gender = (os.getenv("ASSISTANT_GENDER", "female").strip().lower() or "female")
+    # Show the solution configuration side panel automatically when a chat starts
+    show_config_panel_on_start = _bool("SHOW_CONFIG_PANEL_ON_START", False)

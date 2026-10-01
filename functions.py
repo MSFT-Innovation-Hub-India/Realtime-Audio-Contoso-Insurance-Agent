@@ -1,4 +1,5 @@
 import struct
+import time
 from contextlib import closing
 
 import pyodbc
@@ -11,6 +12,9 @@ from envconfig import DefaultConfig
 
 # pyodbc connection attribute used to pass a Microsoft Entra access token to the ODBC driver
 SQL_COPT_SS_ACCESS_TOKEN = 1256
+SQL_CONNECT_ATTEMPTS = 3
+# Azure SQL transient errors (https://learn.microsoft.com/azure/azure-sql/database/troubleshoot-common-errors-issues)
+SQL_TRANSIENT_ERROR_CODES = (4060, 4221, 10053, 10054, 10060, 10928, 10929, 40197, 40501, 40613, 40540, 49918, 49919, 49920)
 
 
 def perform_search_based_qna(query: str) -> str:
@@ -130,16 +134,46 @@ def register_user_grievance_def(grievance_category: str, grievance_description: 
 
 
 def _get_sql_connection() -> pyodbc.Connection:
-    """Opens a connection to Azure SQL Database authenticated with a Microsoft Entra access token."""
-    token = get_access_token(AZURE_SQL_SCOPE).encode("utf-16-le")
-    token_struct = struct.pack(f"<I{len(token)}s", len(token), token)
+    """Opens a connection to Azure SQL Database authenticated with a Microsoft Entra access token.
+
+    Uses a generous login timeout and retries transient errors, so a cold start in Azure Container Apps
+    (first managed-identity token, gateway redirect, failover) doesn't fail the tool call.
+    """
+    timeout = DefaultConfig.az_db_connection_timeout
     connection_string = (
         f"Driver={{{DefaultConfig.az_db_driver}}};"
         f"Server=tcp:{DefaultConfig.az_db_server},1433;"
         f"Database={DefaultConfig.az_db_database};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout={timeout};"
+        "ConnectRetryCount=3;ConnectRetryInterval=10;"
     )
-    return pyodbc.connect(connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+    last_error = None
+    for attempt in range(1, SQL_CONNECT_ATTEMPTS + 1):
+        token = get_access_token(AZURE_SQL_SCOPE).encode("utf-16-le")
+        token_struct = struct.pack(f"<I{len(token)}s", len(token), token)
+        try:
+            return pyodbc.connect(
+                connection_string,
+                attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct},
+                timeout=timeout,
+            )
+        except pyodbc.Error as e:
+            last_error = e
+            if attempt == SQL_CONNECT_ATTEMPTS or not _is_transient_sql_error(e):
+                raise
+            delay = 2 ** attempt
+            logger.warning(f"Transient SQL connection error (attempt {attempt}), retrying in {delay}s: {e}")
+            time.sleep(delay)
+    raise last_error
+
+
+def _is_transient_sql_error(error: pyodbc.Error) -> bool:
+    text = str(error)
+    sqlstate = error.args[0] if error.args else ""
+    # HYT00/HYT01: login/connection timeout; 08xxx: connection failures
+    return sqlstate in ("HYT00", "HYT01") or str(sqlstate).startswith("08") or any(
+        str(code) in text for code in SQL_TRANSIENT_ERROR_CODES
+    )
 
 
 def get_claim_status_summary(**_model_arguments) -> str:

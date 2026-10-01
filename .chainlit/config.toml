@@ -136,14 +136,14 @@ name = "Contoso Insurance Voice Assistant"
 confirm_new_chat = true
 
 # Description of the assistant. This is used for HTML tags.
-# description = ""
+description = "Contoso Insurance voice agent - Powered by Azure Voice Live in Microsoft Foundry"
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
 cot = "full"
 
 # Specify a CSS file that can be used to customize the user interface.
 # The CSS file can be served from the public directory or via an external link.
-# custom_css = "/public/test.css"
+custom_css = "/public/custom.css"
 
 # Specify additional attributes for a custom CSS file
 # custom_css_attributes = "media=\"print\""
@@ -192,6 +192,13 @@ default_avatar_file_url = ""
 #     icon_url = "https://avatars.githubusercontent.com/u/128686189?s=200&v=4"
 #     url = "https://github.com/Chainlit/chainlit/issues"
 #     target = "_blank" (default)  # Optional: "_self", "_parent", "_top".
+
+[[UI.header_links]]
+    name = "VoiceLive"
+    display_name = "Powered by Azure Voice Live in Microsoft Foundry"
+    icon_url = "/public/voice-live.svg"
+    url = "https://learn.microsoft.com/azure/ai-services/speech-service/voice-live"
+    target = "_blank"
 
 [meta]
 generated_by = "2.12.0"

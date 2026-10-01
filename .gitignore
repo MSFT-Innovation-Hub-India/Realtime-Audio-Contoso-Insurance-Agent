@@ -1,3 +1,25 @@
-.venv
+# --- secrets / local configuration (recreate with scripts/pull-env.ps1 or from .env.example) ---
 .env
-__pycache__
+.env.*
+!.env.example
+
+# --- local Python environment and caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- generated at runtime / by tests ---
+.files/
+tests/output/
+.playwright-mcp/
+
+# --- per-machine workflow state (the deployment plan itself IS committed) ---
+.azure/validate-status.json
+
+# --- editor / OS noise ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

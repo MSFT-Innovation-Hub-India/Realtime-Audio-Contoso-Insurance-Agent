@@ -312,6 +312,7 @@ class VoiceLiveModelClient:
 
         elif event_type == "response.created":
             self._active_response_id = event.get("response", {}).get("id")
+            logger.info(f"Response {self._active_response_id} created")
             self._response_requested = False
             self._response_started.set()
             self._update_response_idle()
@@ -346,10 +347,12 @@ class VoiceLiveModelClient:
 
         elif event_type == "input_audio_buffer.committed":
             # The server accepted the audio as a user turn and will create a response for it.
+            logger.info(f"User turn committed: {event.get('item_id')}")
             self._mark_response_requested()
             self._confirm_user_turn(event.get("item_id"), status="🔄 Processing...")
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
+            logger.info(f"User transcript {event.get('item_id')}: {event.get('transcript', '')!r}")
             self.dispatch(
                 "conversation.input.text.done",
                 {"item_id": event.get("item_id"), "transcript": event.get("transcript", "")},
@@ -370,6 +373,8 @@ class VoiceLiveModelClient:
             self._suppressed_response_ids.discard(response.get("id"))
 
             status = response.get("status")
+            outputs = [o.get("name") or o.get("type") for o in response.get("output", [])]
+            logger.info(f"Response {response.get('id')} {status}: {outputs}")
             if status == "failed":
                 logger.error(f"Response failed: {response.get('status_details')}")
             # gpt-realtime models often speak a short preamble first, so function calls can

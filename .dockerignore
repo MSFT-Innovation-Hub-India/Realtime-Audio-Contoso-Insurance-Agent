@@ -1,0 +1,25 @@
+# secrets and local environment - never send to the build context
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.azure/
+.git/
+.github/
+.gitignore
+.vscode/
+.playwright-mcp/
+__pycache__/
+*.pyc
+.pytest_cache/
+.files/
+# not needed at runtime
+scripts/
+tests/
+requirements-dev.txt
+pytest.ini
+Dockerfile
+.dockerignore
+*.md
+!chainlit.md

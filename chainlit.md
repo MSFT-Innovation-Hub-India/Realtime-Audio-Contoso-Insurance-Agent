@@ -1,14 +1,16 @@
-# Welcome to Chainlit! 🚀🤖
+# Contoso Insurance Voice Agent
 
-Hi there, Developer! 👋 We're excited to have you on board. Chainlit is a powerful tool designed to help you prototype, debug and share applications built on top of LLMs.
+### 🎙️ Powered by Azure Voice Live in Microsoft Foundry
 
-## Useful Links 🔗
+A speech-to-speech assistant built on the [Azure Voice Live API](https://learn.microsoft.com/azure/ai-services/speech-service/voice-live) with a GPT-Realtime model. It speaks with an Azure HD neural voice and uses tools to answer:
 
-- **Documentation:** Get started with our comprehensive [Chainlit Documentation](https://docs.chainlit.io) 📚
-- **Discord Community:** Join our friendly [Chainlit Discord](https://discord.gg/k73SQ3FyUh) to ask questions, share your projects, and connect with other developers! 💬
+- **Policy and product questions**: Azure AI Search knowledge base
+- **Claim status**: Azure SQL Database
+- **Grievances** (register and track): Atlassian Jira Cloud
 
-We can't wait to see what you create with Chainlit! Happy coding! 💻😊
+Azure resources are accessed with **managed identity** (Microsoft Entra ID), with no keys.
 
-## Welcome screen
-
-To modify the welcome screen, edit the `chainlit.md` file at the root of your project. If you do not want a welcome screen, just leave this file empty.
+**How to use**
+1. Click the microphone icon (or press `P`) and speak. You can talk over the assistant to interrupt it.
+2. Or type a question. Replies are spoken while the microphone is on.
+3. Click **Show configuration** (or use the settings switch) to see the models, voice and Azure resources in use. Click **Hide configuration** to collapse the panel.

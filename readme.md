@@ -36,6 +36,9 @@ The assistant answers policy questions from a knowledge base, looks up the custo
 - **Robust to coughs and background noise**: noise suppression, echo cancellation, Azure semantic VAD, a client-side interrupt debounce and noise-transcript filtering. Brief sounds don't break the response. See [Handling coughs and brief noises](#handling-coughs-and-brief-noises).
 - **Keyless Azure authentication**: Voice Live, Azure AI Search and Azure SQL all use Microsoft Entra ID through `DefaultAzureCredential` (managed identity in Azure, `az login` locally). Only Jira uses an API token.
 - **Correctly ordered live transcript**: user and assistant messages appear in conversational order, even though the server emits their transcripts asynchronously.
+- **Solution configuration side panel**: shows the Voice Live model, transcription model, TTS voice, turn-detection settings and the Azure resources in use. The Atlassian API token and user name are redacted. It's collapsible and closed by default. A "Powered by Azure Voice Live in Microsoft Foundry" badge appears in the header.
+- **Hindi and multilingual replies with a consistent persona**: the assistant speaks with a female voice (Meera) and uses feminine first-person grammar in Hindi ("मैं कर सकती हूँ", "मैं देख रही हूँ"). This is configurable with `ASSISTANT_GENDER`.
+- **Containerized and deployed to Azure Container Apps** with a system-assigned managed identity, using an idempotent `az acr build` + `az containerapp` script.
 - **Tools**:
 
   | Tool | What it does | Backend | Authentication |
@@ -116,10 +119,23 @@ sequenceDiagram
 | [functions.py](functions.py) | Tool implementations: Azure AI Search, Azure SQL (Entra access token through pyodbc), Jira |
 | [azure_auth.py](azure_auth.py) | Shared `DefaultAzureCredential`, per-scope token cache, `CachedTokenCredential` for Azure SDK clients, and token warm-up |
 | [envconfig.py](envconfig.py) | All configuration, read from `.env` or environment variables, with defaults |
-| [.chainlit/config.toml](.chainlit/config.toml) | Chainlit settings. `[features.audio] enabled = true` and `sample_rate = 24000` are required. |
+| [ui_config.py](ui_config.py) | Builds the solution configuration side panel (with secret and user-name redaction) and the "Powered by" text |
+| [.chainlit/config.toml](.chainlit/config.toml) | Chainlit settings. `[features.audio] enabled = true` and `sample_rate = 24000` are required. Also sets the "Powered by" header link and the custom CSS. |
+| [public/](public) | Header badge icon (`voice-live.svg`) and `custom.css` (wraps long values in the side panel) |
+| [chainlit.md](chainlit.md) | Content of the in-app **Readme** panel |
+| [Dockerfile](Dockerfile) | Container image: Python 3.12 slim + Microsoft ODBC Driver 18 (checked at build time), runs as non-root on port 8000 |
+| [.dockerignore](.dockerignore) | Keeps `.env`, `.venv`, `.git`, `.azure`, tests and scripts out of the image |
+| [scripts/deploy.ps1](scripts/deploy.ps1) | Builds with `az acr build` and deploys to Azure Container Apps (identity, RBAC, secrets, probes). Idempotent. |
+| [scripts/grant_sql_access.py](scripts/grant_sql_access.py) | Creates the managed identity's contained database user and adds it to `db_datareader` |
+| [scripts/pull-env.ps1](scripts/pull-env.ps1) | Recreates a local `.env`, including the Jira token, from the deployed Container App (for a new dev machine) |
+| [tests/test_unit.py](tests/test_unit.py) | Offline unit tests (`python -m pytest`): cough debounce, barge-in, response lifecycle, tool deferral, noise filter, redaction, persona grammar, SQL transient errors |
+| [tests/live/](tests/live) | Live tests against Azure: `e2e_voicelive.py` (tools, spoken input with coughs, interruption), `hindi_gender_check.py` (persona grammar), `ui_fake_mic_test.py` (browser with a fake microphone) |
+| [.github/copilot-instructions.md](.github/copilot-instructions.md) | Project context, conventions and known pitfalls for GitHub Copilot / AI-assisted changes |
+| [.azure/deployment-plan.md](.azure/deployment-plan.md) | Deployment plan with validation proof |
 | [.env.example](.env.example) | Template for `.env` |
 | [MESSAGE_SEQUENCING_IMPROVEMENTS.md](MESSAGE_SEQUENCING_IMPROVEMENTS.md) | Detailed notes on how transcript ordering is kept correct |
-| [requirements.txt](requirements.txt) | Python dependencies |
+| [requirements.txt](requirements.txt) / [requirements-dev.txt](requirements-dev.txt) | Runtime dependencies / test tooling (pytest, playwright, numpy) |
+| [pytest.ini](pytest.ini) | Limits `pytest` to the offline tests |
 
 ## Prerequisites
 
@@ -213,14 +229,38 @@ cd Realtime-Audio-Contoso-Insurance-Agent
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 
 az login                              # the identity from "Azure setup"
-Copy-Item .env.example .env           # then edit .env
+pwsh ./scripts/pull-env.ps1           # recreate .env from the deployed app (or: Copy-Item .env.example .env, then edit)
 chainlit run app.py
 ```
 
 Open http://localhost:8000. Use `chainlit run app.py -w` to reload automatically on code changes.
+
+### Continuing development on another machine
+
+Everything needed to change, test and redeploy the app is in the repository. Only `.env` (which holds a secret) and the virtual environment aren't:
+
+1. Install Python 3.10+, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (with `az extension add -n containerapp`), PowerShell 7 and [ODBC Driver 18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server).
+2. Clone the repo, create the venv and install both requirements files (see above).
+3. `az login` with an account that has the [roles above](#2-assign-roles-to-that-identity) (for local runs), and write access to the Container App (for `pull-env.ps1`).
+4. Run `pwsh ./scripts/pull-env.ps1` to rebuild `.env` from the deployed Container App's settings and secret. Docker isn't needed: images are built in ACR.
+5. Check the setup with `python -m pytest` (offline), then `python tests/live/e2e_voicelive.py` (live).
+6. Make your changes, re-run the tests, and redeploy with `pwsh ./scripts/deploy.ps1`.
+
+[.github/copilot-instructions.md](.github/copilot-instructions.md) summarizes the architecture, conventions and known pitfalls, and GitHub Copilot picks it up automatically. [.azure/deployment-plan.md](.azure/deployment-plan.md) records how the current deployment was planned and validated.
+
+### Tests
+
+| Command | Needs Azure? | What it checks |
+| --- | --- | --- |
+| `python -m pytest` | No | 24 unit tests: cough debounce vs. real barge-in, stale-audio suppression, response lifecycle and tool-result deferral, function calls after a spoken preamble, watchdog, session close handling, noise-transcript filter, side-panel redaction, persona grammar, SQL transient-error classification |
+| `python tests/live/e2e_voicelive.py` | Yes | Voice Live end to end: typed question → SQL tool; synthetic spoken question with injected coughs → Jira tool (coughs must not create user turns); a typed message interrupts an in-flight response |
+| `python tests/live/hindi_gender_check.py` | Yes | Hindi replies use the persona's first-person grammatical gender even when the user says "आप … कर सकते हैं" |
+| `python tests/live/ui_fake_mic_test.py --url <url>` | Yes | Drives the real UI in a headless browser with a WAV file as the microphone (speech + cough), then a typed question with the mic off. Run `python -m playwright install chromium` first, or pass `--channel msedge`. |
+
+The live tests need `requirements-dev.txt` (numpy, playwright). They write artifacts such as the fake-mic WAV and screenshots to `tests/output/`, which is git-ignored.
 
 ## Configuration reference
 
@@ -258,7 +298,8 @@ All settings are read from `.env` (loaded by [envconfig.py](envconfig.py)) or fr
 | `ai_semantic_config` | *(required)* | Semantic configuration name, for example `contoso-insurance-faq-config` |
 | `az_db_server` | *(required)* | `<server>.database.windows.net` |
 | `az_db_database` | *(required)* | Database name |
-| `az_db_driver` | `ODBC Driver 18 for SQL Server` | ODBC driver name |
+| `az_db_driver` | `ODBC Driver 18 for SQL Server` | ODBC driver name (installed in the container image) |
+| `az_db_connection_timeout` | `60` | SQL login timeout in seconds. Kept generous so a cold start in Container Apps (first managed-identity token, gateway redirect) doesn't fail the first query. Transient errors are also retried up to 3 times with backoff. |
 | `attlassian_url` | *(required)* | `https://<site>.atlassian.net/` |
 | `attlassian_user_name` | *(required)* | Atlassian account email |
 | `attlassian_api_key` | *(required)* | Atlassian API token (secret) |
@@ -266,7 +307,10 @@ All settings are read from `.env` (loaded by [envconfig.py](envconfig.py)) or fr
 | `grievance_type` | `Task` | Jira issue type for new grievances |
 | `grievance_project_name` | — | Informational only; the code uses the project key |
 | `customer_name` | `Srikantan` | The customer the assistant is talking to. Claim lookups are restricted to this patient, and the name is included in the system prompt. |
+| `ASSISTANT_GENDER` | `female` | Gender of the assistant persona (`female` / `male`). It must match the TTS voice (Meera is female), because it sets the first-person grammar in Hindi and other gendered languages ("मैं कर सकती हूँ" vs "मैं कर सकता हूँ"). |
+| `SHOW_CONFIG_PANEL_ON_START` | `false` | Open the solution configuration side panel automatically when a chat starts |
 | `AZURE_CLIENT_ID` | — | Client id of a **user-assigned** managed identity, if you use one |
+| `AZURE_TOKEN_CREDENTIALS` | — | Set to `ManagedIdentityCredential` by the deploy script, so the container goes straight to the managed identity without probing other credentials (faster cold start) |
 
 ## Using the app
 
@@ -275,6 +319,17 @@ All settings are read from `.env` (loaded by [envconfig.py](envconfig.py)) or fr
 - **Type**: typed questions get a streamed transcript reply. They are also **spoken** if the microphone is on. Chainlit only sets up browser audio playback after the microphone has been started.
 - **Session lifetime**: the Voice Live session opens on the first mic start or typed message. It stays open while you toggle the mic, so context is kept, and it closes when the chat ends (**New Chat** or closing the tab). If the service closes the session, for example after a long idle time, the app shows a notice and opens a new session on your next input. The previous conversation context isn't carried over.
 - **Stop**: the Chainlit stop button cancels the response being generated.
+- **Solution configuration**: the side panel is **collapsed by default**, so the chat uses the full width. Open or close it in any of these ways:
+  - the **Show configuration** / **Hide configuration** buttons under the welcome message
+  - the **settings** (gear) button in the message composer → **Show solution configuration panel** switch → *Confirm*. This stays reachable however far the chat has scrolled.
+  - the ← arrow at the top of the panel, to close it
+  
+  Set `SHOW_CONFIG_PANEL_ON_START=true` to open it automatically for each new chat. The panel lists:
+  - **Azure Voice Live · Microsoft Foundry**: resource, endpoint, API version, Voice Live model, transcription model, TTS voice, persona gender, voice temperature, auth method
+  - **Turn detection & audio processing**: VAD type, threshold, silence and prefix padding, noise guards, barge-in debounce, noise suppression, echo cancellation, audio format
+  - **Azure AI Search**, **Azure SQL Database** and **Jira**: endpoints, index, database, project, and auth method. The Jira API token is shown only as `•••••••• (configured)`, and the user name is masked (for example `ja••••••@c••••••.com`).
+  - **Runtime**: whether the app runs as the Container App's managed identity or a developer sign-in, and the customer in scope
+- **Readme**: the header **Readme** button shows a short in-app guide ([chainlit.md](chainlit.md)). The **Powered by Azure Voice Live in Microsoft Foundry** badge links to the Voice Live documentation.
 
 ## How it works
 
@@ -368,30 +423,102 @@ In the earlier version, a cough or other short noise could be taken as user inpu
 
 ## Deploying to Azure
 
-The app is a standard Python web app, so it runs on **Azure App Service (Linux)**, **Azure Container Apps**, or any host with a managed identity. For App Service:
+### Current deployment
 
-1. Create a Linux Python web app and enable a **system-assigned managed identity**, or attach a user-assigned identity and set `AZURE_CLIENT_ID`.
-2. Give that identity the roles and database user from [Azure setup](#azure-setup).
-3. **Enable WebSockets**, which both Chainlit and the audio stream need:
-   `az webapp config set -g <rg> -n <app> --web-sockets-enabled true`
-4. Add every `.env` setting as an **app setting**. Keep `attlassian_api_key` in **Azure Key Vault** and reference it as `@Microsoft.KeyVault(SecretUri=...)`. Don't deploy the `.env` file.
-5. Set the startup command:
-   `python -m chainlit run app.py --host 0.0.0.0 --port 8000 --headless`
-   Then set `WEBSITES_PORT=8000`, or use the port App Service provides.
-6. Make sure the SQL server firewall or network allows the app (for example *Allow Azure services*, or a private endpoint with VNet integration).
-7. The ODBC driver must be present at runtime. For custom containers (Container Apps / AKS), install `msodbcsql18` in the image.
-8. Browse to the site over **HTTPS**, since the microphone requires a secure context.
+| | |
+| --- | --- |
+| **URL** | https://contoso-insurance-voice-agent.whitemoss-1ee70859.southindia.azurecontainerapps.io |
+| Container App | `contoso-insurance-voice-agent` (resource group `pcdotai-agent`) |
+| Environment | Existing Container Apps environment `pcdotai-agent` (South India, Consumption, with Log Analytics attached) |
+| Image | `pcdotaiagentd10b5a.azurecr.io/contoso-insurance-voice-agent:<timestamp>` (also tagged `latest`) |
+| Identity | System-assigned managed identity |
+| Compute | 1 vCPU / 2 GiB, 1–3 replicas, external ingress on port 8000 with sticky sessions |
 
-The app keeps per-user session state in memory (Chainlit sessions and Voice Live WebSockets). When scaling out, enable **session affinity** (ARR affinity on App Service).
+### Deploy or update with one command
+
+[scripts/deploy.ps1](scripts/deploy.ps1) is idempotent. Run it for the first deployment and for every code change:
+
+```powershell
+az login                                   # Owner/User Access Administrator on the target RGs + SQL Entra admin
+pwsh ./scripts/deploy.ps1                  # build a new image and roll it out
+pwsh ./scripts/deploy.ps1 -SkipBuild -ImageTag <existing-tag>   # redeploy an existing image
+```
+
+The defaults target the resources above. Override them with `-ResourceGroup`, `-Environment`, `-AcrName`, `-AppName`, `-FoundryName`, `-SearchName`, `-MinReplicas`, `-MaxReplicas`, `-Cpu` and `-Memory`.
+
+What the script does:
+
+1. **Builds the image in ACR**: `az acr build` (ACR Tasks, `linux/amd64`), with no local Docker needed. The build is queued with `--no-logs --no-wait` and its status is polled, because the Windows `az` CLI can crash while streaming build logs (a `charmap` encoding error).
+2. **Creates the Container App** on first run with a public bootstrap image and a **system-assigned managed identity**. The identity must exist, and hold `AcrPull`, before the app can pull from the private registry.
+3. **Grants least-privilege RBAC** to the identity:
+
+   | Target | Role |
+   | --- | --- |
+   | ACR `pcdotaiagentd10b5a` | `AcrPull` |
+   | Foundry `ai-foundry-common-ihub` | `Cognitive Services User` + `Foundry User` (needed for the Voice Live WebSocket) |
+   | AI Search `ai-search-vector-001` | `Search Index Data Reader` |
+   | Azure SQL `cdcsampledb` | Contained user `CREATE USER [contoso-insurance-voice-agent] FROM EXTERNAL PROVIDER` + `db_datareader`, via [scripts/grant_sql_access.py](scripts/grant_sql_access.py) |
+
+4. **Waits for `AcrPull` to propagate** before switching images, which avoids a ~15-minute revision timeout on image pull.
+5. **Configures the app**:
+   - the registry, pulled with the managed identity (no admin credentials)
+   - the Jira API token as a **Container App secret** (`attlassian_api_key=secretref:attlassian-api-key`), so it's never baked into the image
+   - all other `.env` values as environment variables, plus `AZURE_TOKEN_CREDENTIALS=ManagedIdentityCredential`
+   - CPU, memory and replicas
+   - ingress on port 8000 with **sticky sessions**, because Chainlit keeps per-user session state in memory
+6. **Sets health probes**, all HTTP `GET /` on port 8000, with generous timings so a cold container isn't restarted before Chainlit is listening:
+
+   | Probe | Initial delay | Period | Timeout | Failure threshold |
+   | --- | --- | --- | --- | --- |
+   | Startup | 5 s | 5 s | 5 s | 36 (≈3 min) |
+   | Readiness | 5 s | 10 s | 5 s | 6 |
+   | Liveness | 30 s | 30 s | 10 s | 3 |
+
+7. Waits for the new revision to become healthy and prints the URL.
+
+### Container image
+
+The [Dockerfile](Dockerfile) uses `python:3.12-slim-bookworm` and installs **Microsoft ODBC Driver 18 for SQL Server** (`msodbcsql18`) from the Microsoft package repository. The build **fails** if `pyodbc.drivers()` doesn't list `ODBC Driver 18 for SQL Server`, so a missing driver is caught at build time rather than on the first claims question. The app runs as a non-root user and listens on `0.0.0.0:8000`.
+
+### Timeouts and cold starts
+
+| Concern | How it's handled |
+| --- | --- |
+| Chainlit takes a while to import and start | Startup probe allows ~3 minutes before giving up, and liveness starts after 30 s |
+| First Azure SQL connection after a cold start | 60 s SQL login timeout (`az_db_connection_timeout`), ODBC `ConnectRetryCount=3`, and app-level retries with backoff for transient errors (`40613`, `40197`, `40501`, `10928`, `HYT00`, …) |
+| Managed identity token latency | `AZURE_TOKEN_CREDENTIALS=ManagedIdentityCredential` skips the credential chain, and tokens are fetched ahead of time when a chat starts and then cached |
+| Long-lived voice WebSockets | Sticky sessions keep a browser on one replica, and `minReplicas=1` avoids scale-to-zero cold starts during a demo |
+
+### Operations
+
+```powershell
+# Logs (console / system events)
+az containerapp logs show -n contoso-insurance-voice-agent -g pcdotai-agent --type console --tail 100
+az containerapp logs show -n contoso-insurance-voice-agent -g pcdotai-agent --type system --tail 50
+
+# Revisions and health
+az containerapp revision list -n contoso-insurance-voice-agent -g pcdotai-agent -o table
+
+# Rotate the Jira token
+az containerapp secret set -n contoso-insurance-voice-agent -g pcdotai-agent --secrets "attlassian-api-key=<new-token>"
+az containerapp revision restart -n contoso-insurance-voice-agent -g pcdotai-agent --revision <active-revision>
+```
+
+Logs also flow to the environment's Log Analytics workspace (tables `ContainerAppConsoleLogs_CL` / `ContainerAppSystemLogs_CL`).
+
+### Other hosts
+
+The app also runs on **Azure App Service (Linux)**, or any host with a managed identity. Enable WebSockets and session affinity, add the `.env` settings as app settings (with the Jira token in Key Vault), and use the startup command `python -m chainlit run app.py --host 0.0.0.0 --port 8000 --headless`. Grant the same roles and database user listed above. Browse over **HTTPS**, since the microphone requires a secure context.
 
 ## Security notes
 
-- **No Azure secrets**: Voice Live, Search and SQL use Entra ID tokens. The only secret is the Jira API token, which should be stored in Key Vault when hosted.
+- **No Azure secrets**: Voice Live, Search and SQL use Entra ID tokens. The only secret is the Jira API token. In Container Apps it's stored as a **Container App secret** and referenced by `secretref:`, so it's never in the image or in plain environment-variable definitions.
+- **Redaction in the UI**: the configuration side panel never shows any part of the Jira API token, and masks the Atlassian user name. Azure endpoints are shown because they're protected by managed identity and RBAC.
 - `.env` is git-ignored. Never commit it.
 - **Least privilege**: the app only needs read access to Search and SQL (`Search Index Data Reader`, `db_datareader`). The Jira account only needs permission to create and browse issues in the grievance project.
 - **Patient data isolation**: `get_claim_status_summary` has no arguments. The patient is always the configured `customer_name`, never a name chosen by the model, so a user can't talk the assistant into disclosing another patient's claims. In a multi-user deployment, replace `customer_name` with the authenticated Chainlit user (see [Chainlit authentication](https://docs.chainlit.io/authentication/overview)).
 - **Input validation**: the grievance id is validated as an integer before it's used in JQL. SQL queries are parameterized.
-- **Authentication**: the Chainlit UI has no sign-in by default. Add authentication, such as Entra ID OAuth through Chainlit, or App Service Easy Auth, before exposing it beyond a demo.
+- **Authentication**: the Chainlit UI has no sign-in by default, and the Container App has **public ingress**, so anyone with the URL can use the demo (and its tools). Before sharing it beyond a demo, add authentication, such as Container Apps built-in authentication (Easy Auth) with Microsoft Entra ID (`az containerapp auth microsoft update …`) or Chainlit OAuth.
 - `allow_origins = ["*"]` in `.chainlit/config.toml` is fine locally. Restrict it to your site's origin in production.
 
 ## Troubleshooting
@@ -404,7 +531,10 @@ The app keeps per-user session state in memory (Chainlit sessions and Voice Live
 | Knowledge-base answers say *"We had an issue searching…"* and the logs show 403 | Missing `Search Index Data Reader`, or role-based access isn't enabled on the search service ([step 3](#3-enable-role-based-access-on-azure-ai-search)). |
 | Claims answer *"We had an issue retrieving your claim status"* and the logs show `Login failed for user '<token-identified principal>'` | No database user for the identity ([step 4](#4-create-the-database-user-for-the-identity)). |
 | `Data source name not found and no default driver specified` | ODBC Driver 18 isn't installed, or `az_db_driver` has the wrong name. |
-| SQL timeout or connection refused | The SQL firewall blocks your IP, or a serverless database is resuming. Retry after a few seconds. |
+| SQL timeout or connection refused | The SQL firewall blocks the client (locally: your IP; in Azure: enable *Allow Azure services* or use a private endpoint). Transient errors and slow first logins are retried automatically. If they persist, raise `az_db_connection_timeout`. |
+| Container App revision stuck in *Activating* or failing to pull the image | `AcrPull` hasn't propagated to the new identity yet. Wait a few minutes and re-run `scripts/deploy.ps1 -SkipBuild -ImageTag <tag>`. |
+| Container restarts shortly after start | Check `az containerapp logs show --type system` for probe failures. The startup probe allows ~3 minutes, so a restart usually means the app crashed; look at the console logs. |
+| `'charmap' codec can't encode characters` from `az acr build` | A Windows `az` CLI log-streaming bug. The build itself continues. `deploy.ps1` avoids it by using `--no-logs --no-wait` and polling. |
 | Jira errors / 401 | The API token expired or was revoked, the wrong `attlassian_user_name` (it must be the token owner's email), or no permission on the project. |
 | Jira *"issue type … not valid"* | `grievance_type` doesn't exist in the project. Use one of the project's issue types. |
 | The first connection takes several seconds locally | `DefaultAzureCredential` probes for a managed identity before falling back to the Azure CLI. This only happens once per process. To skip the probe locally, set `AZURE_TOKEN_CREDENTIALS=dev` in your shell (not in hosted app settings). |
@@ -413,6 +543,8 @@ The app keeps per-user session state in memory (Chainlit sessions and Voice Live
 | No audio at all, or a `features.audio` error | Check `.chainlit/config.toml` has `[features.audio] enabled = true` and `sample_rate = 24000`. |
 | A notice says *"The voice session was closed by the service"* | The service closed an idle or long session. The next mic input or message reconnects automatically, without the previous context. |
 | Verbose logs | Azure SDK HTTP logging is reduced to warnings in `app.py`. Change `logging.getLogger("azure").setLevel(...)` to see more. |
+| In Hindi, the assistant refers to itself with the wrong gender ("मैं कर सकता हूँ" with a female voice) | `ASSISTANT_GENDER` must match the TTS voice. The system prompt enforces first-person forms for that gender. Verify with `python tests/live/hindi_gender_check.py`. |
+| UI labels are blank grey pills (Readme button, settings dialog buttons, input placeholder) | The `.chainlit/translations/*.json` files are from an older Chainlit version. Delete `.chainlit/translations` and run `chainlit init` to regenerate them for the installed version. |
 
 ## Known limitations
 
@@ -436,6 +568,11 @@ The original sample used the Azure OpenAI Realtime API (`gpt-4o-realtime-preview
 - **Jira fixes**: JQL uses the quoted project key (the old unquoted project-name query broke on names with spaces). Descriptions in Atlassian Document Format (from the v3 enhanced JQL search) are converted to text. Grievance ids are validated. A connection error no longer calls `exit(1)`, which used to stop the server.
 - **Security**: the claims lookup is restricted to the configured customer.
 - **Upgraded to Chainlit 2.x**: regenerated `.chainlit/config.toml` with audio enabled, and updated dependencies (numpy is no longer needed).
+- **Adds the solution configuration side panel**, with redaction, and the "Powered by Azure Voice Live in Microsoft Foundry" branding. The panel is collapsible (Show/Hide buttons and a persistent settings switch) and collapsed by default.
+- **Persona-consistent Hindi**: the system prompt enforces first-person grammatical gender matching the voice (`ASSISTANT_GENDER`).
+- **Regenerated the Chainlit translation files for 2.x**, which fixes blank UI labels left over from the 1.x files.
+- **Developer tooling in the repo**: offline unit tests, live end-to-end, Hindi and browser fake-mic tests, `scripts/pull-env.ps1` to recreate `.env` on a new machine, and `.github/copilot-instructions.md`.
+- **Containerized and deployed to Azure Container Apps** (environment `pcdotai-agent`, South India). The image is built with `az acr build` and includes ODBC Driver 18. The app uses a system-assigned managed identity with least-privilege RBAC, the Jira token is a Container App secret, and the app has generous health probes and a longer SQL login timeout with transient-error retries.
 
 ## References
 
@@ -445,5 +582,7 @@ The original sample used the Azure OpenAI Realtime API (`gpt-4o-realtime-preview
 - [DefaultAzureCredential](https://learn.microsoft.com/python/api/azure-identity/azure.identity.defaultazurecredential)
 - [Connect to Azure SQL with Microsoft Entra authentication (Python)](https://learn.microsoft.com/azure/azure-sql/database/azure-sql-passwordless-migration-python)
 - [Azure AI Search role-based access](https://learn.microsoft.com/azure/search/search-security-enable-roles)
+- [Azure Container Apps: managed identities](https://learn.microsoft.com/azure/container-apps/managed-identity) · [health probes](https://learn.microsoft.com/azure/container-apps/health-probes) · [ACR image pull with managed identity](https://learn.microsoft.com/azure/container-apps/managed-identity-image-pull)
+- [Install Microsoft ODBC Driver 18 for SQL Server (Linux)](https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server)
 - [Chainlit documentation](https://docs.chainlit.io)
 - [VoiceLiveAPI-Retail-Agent-Service-Demo (reference implementation)](https://github.com/MSFT-Innovation-Hub-India/VoiceLiveAPI-Retail-Agent-Service-Demo)
