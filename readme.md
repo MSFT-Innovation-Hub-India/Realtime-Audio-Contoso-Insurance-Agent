@@ -58,6 +58,12 @@ The assistant answers policy questions from a knowledge base, looks up the custo
 
 ## Architecture
 
+![Solution Architecture – Azure Voice Live Agent](images/architecture.png)
+
+Users talk to the **Voice Agent App**, a Chainlit web app running in **Azure Container Apps**. The app streams audio to the **Azure Voice Live WebSocket API** in **Microsoft Foundry**, which uses the OpenAI `gpt-realtime-2.1` model for speech-to-speech. When the model calls a tool, the app queries **Azure SQL Database** (claims), **Azure AI Search** (policy knowledge base) or **Jira** (grievances). Azure resources are accessed with the Container App's managed identity.
+
+How the components connect inside the app:
+
 ```
 ┌──────────────────────────────┐
 │ Browser — Chainlit UI        │  mic in / speaker out: pcm16 @ 24 kHz
@@ -122,6 +128,7 @@ sequenceDiagram
 | [ui_config.py](ui_config.py) | Builds the solution configuration side panel (with secret and user-name redaction) and the "Powered by" text |
 | [.chainlit/config.toml](.chainlit/config.toml) | Chainlit settings. `[features.audio] enabled = true` and `sample_rate = 24000` are required. Also sets the "Powered by" header link and the custom CSS. |
 | [public/](public) | Header badge icon (`voice-live.svg`) and `custom.css` (wraps long values in the side panel) |
+| [images/](images) | README images (solution architecture diagram) |
 | [chainlit.md](chainlit.md) | Content of the in-app **Readme** panel |
 | [Dockerfile](Dockerfile) | Container image: Python 3.12 slim + Microsoft ODBC Driver 18 (checked at build time), runs as non-root on port 8000 |
 | [.dockerignore](.dockerignore) | Keeps `.env`, `.venv`, `.git`, `.azure`, tests and scripts out of the image |

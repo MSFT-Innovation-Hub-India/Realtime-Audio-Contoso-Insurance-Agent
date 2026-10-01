@@ -15,6 +15,7 @@ __pycache__/
 .pytest_cache/
 .files/
 # not needed at runtime
+images/
 scripts/
 tests/
 requirements-dev.txt
