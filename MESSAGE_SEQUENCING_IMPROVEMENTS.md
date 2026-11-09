@@ -25,9 +25,9 @@ transcript always lands in the right bubble, even if several turns overlap.
 
 ### 2. Single ordered dispatch queue
 
-`VoiceLiveModelClient.dispatch()` puts UI events on an `asyncio.Queue` that a single worker drains. Previously each
-event was handled in its own `asyncio.create_task`, so a message `update()` could race ahead of its `send()`, or
-audio chunks could be reordered. The queue applies every send, update and audio chunk in arrival order.
+`VoiceLiveModelClient.dispatch()` puts UI events on an `asyncio.Queue` that a single worker drains. Handling each
+event in its own task would let a message `update()` race ahead of its `send()`, or reorder audio chunks. The queue
+applies every send, update and audio chunk in arrival order.
 
 ### 3. Typed messages
 

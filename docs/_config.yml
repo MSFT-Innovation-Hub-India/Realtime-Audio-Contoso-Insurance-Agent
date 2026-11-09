@@ -1,0 +1,18 @@
+title: Real-Time Insurance Voice Agent with Azure Voice Live API and gpt-realtime-2.1
+description: Speech-to-speech insurance voice agent on Azure Voice Live API and gpt-realtime-2.1, with Azure AI Search, Azure SQL and Jira function calling.
+url: https://msft-innovation-hub-india.github.io
+baseurl: /Realtime-Audio-Contoso-Insurance-Agent
+lang: en
+
+repo_url: https://github.com/MSFT-Innovation-Hub-India/Realtime-Audio-Contoso-Insurance-Agent
+og_image: /assets/architecture.png
+
+# Search Console HTML-tag verification: paste only the content value. The meta tag renders only when this is set.
+google_site_verification: ""
+
+markdown: kramdown
+plugins:
+  - jekyll-sitemap
+
+exclude:
+  - README.md

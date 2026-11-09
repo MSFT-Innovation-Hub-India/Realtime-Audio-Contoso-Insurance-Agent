@@ -14,6 +14,8 @@ Speech-to-speech insurance assistant: **Chainlit 2.x UI → `voicelive_client.py
 
 ## Conventions and constraints
 
+- **Project site**: `docs/` is a Jekyll GitHub Pages site (landing page, sitemap, robots.txt, Open Graph tags). Site metadata lives in `docs/_config.yml`; keep the model name and description there in sync with the readme.
+
 - **Auth**: every Azure call goes through `azure_auth.py` (one `DefaultAzureCredential`, token cache per scope). Never add API keys for Azure services. Jira is the only secret (`attlassian_api_key`); in Azure it's a Container App secret (`secretref:`).
 - **Config**: all settings live in `envconfig.py` (`DefaultConfig`). When adding a setting, update `.env.example`, the readme configuration table and, if it's user-visible, `ui_config.py`. `scripts/deploy.ps1` pushes every `.env` key to the Container App automatically.
 - **Config side panel** (`ui_config.py`): show Azure resources in full; never show secrets or personal identifiers (use `redact_secret` / `redact_email`). `tests/test_unit.py` asserts this.

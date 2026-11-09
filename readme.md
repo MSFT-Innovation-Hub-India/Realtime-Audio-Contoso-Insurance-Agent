@@ -1,20 +1,22 @@
-# Contoso Insurance Voice Agent — Azure Voice Live API + GPT-Realtime
+# Real-Time Insurance Voice Agent with Azure Voice Live API, gpt-realtime-2.1 and Function Calling
 
-A speech-to-speech AI assistant for **Contoso Insurance**, built on the **[Azure Voice Live API](https://learn.microsoft.com/azure/ai-services/speech-service/voice-live)** of a Microsoft Foundry resource and the `gpt-realtime-2.1` model. Customers talk to the assistant, or type, and it answers in natural speech with an Azure HD voice. A live transcript of both sides appears in a [Chainlit](https://docs.chainlit.io) web UI.
+Speech-to-speech insurance voice agent on Azure Voice Live API and gpt-realtime-2.1, with Azure AI Search, Azure SQL and Jira function calling.
 
-The assistant answers policy questions from a knowledge base, looks up the customer's insurance claims, and registers and tracks grievances. It does this through **client-side function calling** against Azure AI Search, Azure SQL Database and Atlassian Jira.
+**🌐 Project site: [msft-innovation-hub-india.github.io/Realtime-Audio-Contoso-Insurance-Agent](https://msft-innovation-hub-india.github.io/Realtime-Audio-Contoso-Insurance-Agent/)**
 
 ---
 
 ## Contents
 
+- [What this is](#what-this-is)
+- [The scenario](#the-scenario)
 - [Features](#features)
 - [What you can ask](#what-you-can-ask)
 - [Architecture](#architecture)
 - [Project structure](#project-structure)
 - [Prerequisites](#prerequisites)
 - [Azure setup](#azure-setup)
-- [Local setup and run](#local-setup-and-run)
+- [How to run](#how-to-run)
 - [Configuration reference](#configuration-reference)
 - [Using the app](#using-the-app)
 - [How it works](#how-it-works)
@@ -23,10 +25,25 @@ The assistant answers policy questions from a knowledge base, looks up the custo
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
-- [Changes from the previous version](#changes-from-the-previous-version)
 - [References](#references)
 
 ---
+
+## What this is
+
+A speech-to-speech AI assistant for **Contoso Insurance**, built on the **[Azure Voice Live API](https://learn.microsoft.com/azure/ai-services/speech-service/voice-live)** of a Microsoft Foundry resource and the `gpt-realtime-2.1` model. Customers talk to the assistant, or type, and it answers in natural speech with an Azure HD voice. A live transcript of both sides appears in a [Chainlit](https://docs.chainlit.io) web UI.
+
+The assistant answers policy questions from a knowledge base, looks up the customer's insurance claims, and registers and tracks grievances. It does this through **client-side function calling** against Azure AI Search, Azure SQL Database and Atlassian Jira. It is containerized and runs on Azure Container Apps with keyless (Microsoft Entra ID / managed identity) access to Azure services.
+
+## The scenario
+
+A health-insurance customer calls the assistant instead of waiting on hold or searching a portal. In one natural conversation, the customer can:
+
+- ask about Contoso's plans, coverage and the claim process (answered from an Azure AI Search knowledge base),
+- check the status of their own claims (read from Azure SQL Database),
+- raise a complaint and later ask for its status (created and tracked as Jira issues).
+
+Real conversations include coughs, keyboard clicks, background chatter and filler words ("uh", "hmm"). The agent is built to **ignore non-speech noise and to stop talking only when the customer actually says something**, so it doesn't cut itself off mid-sentence. See [Handling coughs and brief noises](#handling-coughs-and-brief-noises).
 
 ## Features
 
@@ -228,7 +245,7 @@ The server's firewall must allow the client: your IP for local runs, and *Allow 
 
 **Jira project**: grievances are created in the project `grievance_project_key` with issue type `grievance_type` (for example `Task`, which must exist in the project). The grievance id given to the customer is the numeric Jira issue **id** (for example `10015`), not the key (for example `DSS-12`).
 
-## Local setup and run
+## How to run
 
 ```powershell
 git clone <this-repo>
@@ -405,7 +422,7 @@ Details are in [MESSAGE_SEQUENCING_IMPROVEMENTS.md](MESSAGE_SEQUENCING_IMPROVEME
 
 ## Handling coughs and brief noises
 
-In the earlier version, a cough or other short noise could be taken as user input. It would stop the assistant's audio mid-sentence or trigger a spurious new response. The app now protects against this in layers:
+A cough or other short noise must not stop the assistant's audio mid-sentence or trigger a spurious response. The assistant is interrupted only when the user actually says something. The app protects against false triggers in layers:
 
 1. **Server-side noise suppression and echo cancellation**: `azure_deep_noise_suppression` removes non-speech background sound before VAD sees it. `server_echo_cancellation` stops the assistant's own voice (from speakers) from counting as user speech.
 2. **Azure semantic VAD** (`azure_semantic_vad`) with:
@@ -560,26 +577,6 @@ The app also runs on **Azure App Service (Linux)**, or any host with a managed i
 - The demo serves a single configured customer (`customer_name`). Multi-user use needs Chainlit authentication, with the signed-in user mapped to the patient.
 - Knowledge-base answers use the top 2 search results only. Increase `top` in `perform_search_based_qna` for broader grounding, at the cost of more tokens.
 - The cough and noise defaults were tuned with a typical laptop microphone. Different rooms and microphones may need the [tuning](#handling-coughs-and-brief-noises) above.
-
-## Changes from the previous version
-
-The original sample used the Azure OpenAI Realtime API (`gpt-4o-realtime-preview`) with API keys. This version:
-
-- **Moves to the Azure Voice Live API** with `gpt-realtime-2.1` (API version `2026-04-10`), an Azure HD voice, Azure semantic VAD, deep noise suppression, server echo cancellation and `gpt-4o-transcribe`. `realtime_client.py` and `utils.py` are replaced by `voicelive_client.py`.
-- **Goes keyless on Azure**: Voice Live, Azure AI Search and Azure SQL use Microsoft Entra ID / managed identity instead of the OpenAI key, Search key and SQL username/password. Tokens are cached and fetched ahead of time.
-- **Fixes function calling for gpt-realtime-2.x**: every `function_call` item in a response is handled, not just `output[0]`. Tools run off the event loop.
-- **Removes the duplicate `response.create`** that used to be sent on `input_audio_buffer.committed`, which could cause double responses. The server creates it automatically. Adds full response lifecycle tracking, with deferred follow-ups and a watchdog.
-- **Adds cough and noise robustness**: layered server and client guards, including the interrupt debounce from the VoiceLiveAPI-Retail-Agent-Service-Demo repo.
-- **Improves transcript ordering**: an ordered UI event queue, placeholders keyed by the server `item_id`, noise placeholders removed, and stale audio suppressed after barge-in.
-- **Keeps the session open across mic toggles**, supports text-only turns without starting the mic, and reconnects after a server-side close.
-- **Jira fixes**: JQL uses the quoted project key (the old unquoted project-name query broke on names with spaces). Descriptions in Atlassian Document Format (from the v3 enhanced JQL search) are converted to text. Grievance ids are validated. A connection error no longer calls `exit(1)`, which used to stop the server.
-- **Security**: the claims lookup is restricted to the configured customer.
-- **Upgraded to Chainlit 2.x**: regenerated `.chainlit/config.toml` with audio enabled, and updated dependencies (numpy is no longer needed).
-- **Adds the solution configuration side panel**, with redaction, and the "Powered by Azure Voice Live in Microsoft Foundry" branding. The panel is collapsible (Show/Hide buttons and a persistent settings switch) and collapsed by default.
-- **Persona-consistent Hindi**: the system prompt enforces first-person grammatical gender matching the voice (`ASSISTANT_GENDER`).
-- **Regenerated the Chainlit translation files for 2.x**, which fixes blank UI labels left over from the 1.x files.
-- **Developer tooling in the repo**: offline unit tests, live end-to-end, Hindi and browser fake-mic tests, `scripts/pull-env.ps1` to recreate `.env` on a new machine, and `.github/copilot-instructions.md`.
-- **Containerized and deployed to Azure Container Apps** (environment `pcdotai-agent`, South India). The image is built with `az acr build` and includes ODBC Driver 18. The app uses a system-assigned managed identity with least-privilege RBAC, the Jira token is a Container App secret, and the app has generous health probes and a longer SQL login timeout with transient-error retries.
 
 ## References
 
